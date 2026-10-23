@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -251,11 +253,8 @@ func buildSCEPServer(logger *slog.Logger, cfg *config.Config, baoClient *bao.Cli
 		"ra_subject", raCert.Subject.CommonName,
 		"allow_sha1", cfg.SCEP.AllowSHA1,
 	)
-	// Plain HTTP by design: SCEP carries its own signing and encryption. Bind it
-	// to a trusted network — there is no transport authentication here.
-	logger.Warn("SCEP listener is plain HTTP; bind it to a trusted network")
 
-	return &http.Server{
+	srv := &http.Server{
 		Addr: cfg.SCEP.ListenAddr,
 		// Same limiter as EST: SCEP's unauthenticated RSA decrypt is strictly
 		// more expensive than EST's proof-of-possession check.
@@ -266,7 +265,30 @@ func buildSCEPServer(logger *slog.Logger, cfg *config.Config, baoClient *bao.Cli
 		IdleTimeout:       cfg.Server.IdleTimeout.Std(),
 		MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
-	}, nil
+	}
+
+	// Plain HTTP when no SCEP TLS files are configured: SCEP carries its own
+	// signing and encryption, so transport TLS is optional. When TLS files ARE
+	// configured the listener speaks HTTPS, which is what network-facing
+	// deployments want — it lets the broker sit behind an L4 passthrough
+	// (consul mesh gateway) without an extra TLS-terminating tier.
+	if cfg.SCEP.TLSCertFile != "" && cfg.SCEP.TLSKeyFile != "" {
+		pair, err := tls.LoadX509KeyPair(cfg.SCEP.TLSCertFile, cfg.SCEP.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("scep: load TLS keypair: %w", err)
+		}
+		srv.TLSConfig = est.TLSConfig(pair)
+		logger.Info("SCEP listener TLS enabled",
+			"addr", cfg.SCEP.ListenAddr,
+			"tls_cert_file", cfg.SCEP.TLSCertFile,
+		)
+	} else {
+		// Plain HTTP by design: SCEP carries its own signing and encryption. Bind it
+		// to a trusted network — there is no transport authentication here.
+		logger.Warn("SCEP listener is plain HTTP; bind it to a trusted network")
+	}
+
+	return srv, nil
 }
 
 // selectAuthorizer builds the pipeline from config; -dev-insecure-allow-all

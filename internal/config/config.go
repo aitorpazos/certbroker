@@ -31,7 +31,10 @@ type Config struct {
 }
 
 // SCEP configures the optional RFC 8894 listener, off by default. Plain HTTP by
-// design (CMS carries its own crypto), so bind it to a trusted network.
+// design (CMS carries its own crypto), so bind it to a trusted network. TLS is
+// optional: when TLSCertFile/TLSKeyFile are set the listener speaks HTTPS so a
+// network-facing deployment can sit behind an L4 passthrough without an extra
+// TLS-terminating tier.
 type SCEP struct {
 	Enabled bool `yaml:"enabled"`
 	// ListenAddr is the plain-HTTP SCEP listener, e.g. ":8080".
@@ -40,6 +43,10 @@ type SCEP struct {
 	// at rest that EST does not need.
 	RACertFile string `yaml:"ra_cert_file"`
 	RAKeyFile  string `yaml:"ra_key_file"`
+	// TLSCertFile/TLSKeyFile optionally make the SCEP listener speak HTTPS.
+	// Unset means plain HTTP (the upstream default).
+	TLSCertFile string `yaml:"tls_cert_file"`
+	TLSKeyFile  string `yaml:"tls_key_file"`
 	// AllowSHA1 re-admits SHA-1 for clients too old to do better. Off by
 	// default; turning it on is a recorded decision, not a convenience.
 	AllowSHA1 bool `yaml:"allow_sha1"`
