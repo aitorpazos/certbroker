@@ -301,8 +301,8 @@ func (c *Config) Validate() error {
 	if c.OpenBao.Mount == "" {
 		return fmt.Errorf("openbao.mount is required")
 	}
-	if c.OpenBao.AppRole.RoleID == "" {
-		return fmt.Errorf("openbao.approle.role_id is required")
+	if c.OpenBao.AppRole.RoleID == "" && c.OpenBao.AppRole.RoleIDEnv == "" {
+		return fmt.Errorf("openbao.approle.role_id or openbao.approle.role_id_env is required")
 	}
 	switch ar := c.OpenBao.AppRole; {
 	case ar.SecretIDFile != "":
