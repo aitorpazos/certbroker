@@ -4,16 +4,24 @@ package cms
 
 import (
 	"crypto"
+	"crypto/cipher"
+	"crypto/des"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/smallstep/pkcs7"
 )
 
 // The library picks content encryption from a global defaulting to DES-CBC.
 // Set once here: there is no per-call option and mutating it later would race.
+// Reply envelopes for a 3DES request never touch this global — see
+// EncryptWithAlg, which builds the 3DES envelope without the library.
 func init() {
 	pkcs7.ContentEncryptionAlgorithm = pkcs7.EncryptionAlgorithmAES256CBC
 }
@@ -158,14 +166,203 @@ func Decrypt(der []byte, cert *x509.Certificate, key crypto.PrivateKey) ([]byte,
 // Encrypt seals content to a single recipient as EnvelopedData, using the
 // content-encryption algorithm pinned in init.
 func Encrypt(content []byte, recipient *x509.Certificate) ([]byte, error) {
+	return EncryptWithAlg(content, recipient, pkcs7.EncryptionAlgorithmAES256CBC)
+}
+
+// EncryptionAlg names a content-encryption algorithm for reply envelopes.
+// smallstep/pkcs7's constants are untyped ints, so the alias is int.
+type EncryptionAlg = int
+
+// EncryptionAlgorithmDESEDE3CBC is absent from smallstep/pkcs7's encrypt
+// constants (the library can decrypt 3DES but not encrypt it). It occupies an
+// unused iota slot; the value is private to this process.
+const EncryptionAlgorithmDESEDE3CBC = pkcs7.EncryptionAlgorithmAES256GCM + 1
+
+// RFC 8894 §3.5: the reply SHALL be encrypted with the same content-encryption
+// algorithm as the request. Apple's SCEP client (mdmclient) always sends
+// 3DES — its own code says "SCEP doesn't support DES3 but we're going to use
+// it anyway" — so a 3DES request must get a 3DES reply or the client cannot
+// decrypt it. smallstep/pkcs7 can only DECRYPT 3DES (its Encrypt switch has no
+// 3DES case), so the 3DES envelope is built here with the same wire format.
+func EncryptWithAlg(content []byte, recipient *x509.Certificate, alg EncryptionAlg) ([]byte, error) {
+	switch alg {
+	case EncryptionAlgorithmDESEDE3CBC:
+		return encryptDES3(content, recipient)
+	default:
+		// Unknown / unsupported request cipher: fall back to the pinned
+		// default rather than inventing a reply cipher the client never
+		// asked for.
+		if recipient == nil {
+			return nil, errors.New("cms: no recipient certificate")
+		}
+		der, err := pkcs7.Encrypt(content, []*x509.Certificate{recipient})
+		if err != nil {
+			return nil, fmt.Errorf("cms: encrypt: %w", err)
+		}
+		return der, nil
+	}
+}
+
+// DetectContentAlg reports the content-encryption algorithm of a
+// ContentInfo(EnvelopedData) message, as used in an SCEP request envelope.
+// found is false when the algorithm is not recognized (or the shape is
+// unexpected), in which case callers reply with the default cipher.
+func DetectContentAlg(der []byte) (alg EncryptionAlg, found bool) {
+	if len(der) == 0 {
+		return 0, false
+	}
+	var ci struct {
+		ContentType asn1.ObjectIdentifier
+		Content     asn1.RawValue `asn1:"tag:0,explicit,optional"`
+	}
+	if _, err := asn1.Unmarshal(der, &ci); err != nil {
+		return 0, false
+	}
+	var env struct {
+		Version        int
+		RecipientInfos asn1.RawValue `asn1:"set"`
+		ECI            struct {
+			ContentType                asn1.ObjectIdentifier
+			ContentEncryptionAlgorithm pkix.AlgorithmIdentifier
+			EncryptedContent           asn1.RawValue `asn1:"tag:0,optional"`
+		}
+	}
+	if _, err := asn1.Unmarshal(ci.Content.Bytes, &env); err != nil {
+		return 0, false
+	}
+	oid := env.ECI.ContentEncryptionAlgorithm.Algorithm
+	switch {
+	case oid.Equal(pkcs7.OIDEncryptionAlgorithmDESEDE3CBC):
+		return EncryptionAlgorithmDESEDE3CBC, true
+	case oid.Equal(pkcs7.OIDEncryptionAlgorithmAES256CBC):
+		return pkcs7.EncryptionAlgorithmAES256CBC, true
+	case oid.Equal(pkcs7.OIDEncryptionAlgorithmAES128CBC):
+		return pkcs7.EncryptionAlgorithmAES128CBC, true
+	default:
+		return 0, false
+	}
+}
+
+// 3DES EnvelopedData, mirroring smallstep/pkcs7's wire format exactly
+// (struct shapes, PKCS#1 v1.5 key transport, PKCS#7 block padding).
+type des3IssuerAndSerial struct {
+	IssuerName   asn1.RawValue
+	SerialNumber *big.Int
+}
+
+type des3RecipientInfo struct {
+	Version                int
+	IssuerAndSerialNumber  des3IssuerAndSerial
+	KeyEncryptionAlgorithm pkix.AlgorithmIdentifier
+	EncryptedKey           []byte
+}
+
+type des3EncryptedContentInfo struct {
+	ContentType                asn1.ObjectIdentifier
+	ContentEncryptionAlgorithm pkix.AlgorithmIdentifier
+	EncryptedContent           asn1.RawValue `asn1:"tag:0,optional"`
+}
+
+type des3EnvelopedData struct {
+	Version              int
+	RecipientInfos       []des3RecipientInfo `asn1:"set"`
+	EncryptedContentInfo des3EncryptedContentInfo
+}
+
+type des3ContentInfo struct {
+	ContentType asn1.ObjectIdentifier
+	Content     asn1.RawValue `asn1:"tag:0,explicit,optional"`
+}
+
+// encryptDES3 seals content as ContentInfo(EnvelopedData) with 3DES-CBC and an
+// RSA PKCS#1 v1.5-wrapped 3DES key — the exact format Apple's SCEP client
+// produces for its requests and expects in replies.
+func encryptDES3(content []byte, recipient *x509.Certificate) ([]byte, error) {
 	if recipient == nil {
 		return nil, errors.New("cms: no recipient certificate")
 	}
-	der, err := pkcs7.Encrypt(content, []*x509.Certificate{recipient})
+	pub, ok := recipient.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("cms: 3DES envelope needs an RSA recipient, got %T", recipient.PublicKey)
+	}
+	key := make([]byte, 24) // 3DES = 24-byte key (K3=K1 for 2-key variants)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("cms: 3des key: %w", err)
+	}
+	iv := make([]byte, des.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, fmt.Errorf("cms: 3des iv: %w", err)
+	}
+	block, err := des.NewTripleDESCipher(key)
 	if err != nil {
-		return nil, fmt.Errorf("cms: encrypt: %w", err)
+		return nil, fmt.Errorf("cms: 3des cipher: %w", err)
+	}
+	padded := pkcs7Pad(content, block.BlockSize())
+	if padded == nil {
+		return nil, errors.New("cms: 3des padding failed")
+	}
+	enc := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(enc, padded)
+	wrappedKey, err := rsa.EncryptPKCS1v15(rand.Reader, pub, key)
+	if err != nil {
+		return nil, fmt.Errorf("cms: 3des key wrap: %w", err)
+	}
+	env := des3EnvelopedData{
+		Version: 0,
+		RecipientInfos: []des3RecipientInfo{{
+			Version: 0,
+			IssuerAndSerialNumber: des3IssuerAndSerial{
+				IssuerName:   asn1.RawValue{FullBytes: recipient.RawIssuer},
+				SerialNumber: recipient.SerialNumber,
+			},
+			KeyEncryptionAlgorithm: pkix.AlgorithmIdentifier{
+				Algorithm: pkcs7.OIDEncryptionAlgorithmRSA,
+			},
+			EncryptedKey: wrappedKey,
+		}},
+		EncryptedContentInfo: des3EncryptedContentInfo{
+			ContentType: pkcs7.OIDData,
+			ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
+				Algorithm: pkcs7.OIDEncryptionAlgorithmDESEDE3CBC,
+				Parameters: asn1.RawValue{
+					Tag:   asn1.TagOctetString,
+					Bytes: iv,
+				},
+			},
+			EncryptedContent: marshalEncryptedContent(enc),
+		},
+	}
+	inner, err := asn1.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("cms: 3des envelope: %w", err)
+	}
+	ci := des3ContentInfo{
+		ContentType: pkcs7.OIDEnvelopedData,
+		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: inner},
+	}
+	der, err := asn1.Marshal(ci)
+	if err != nil {
+		return nil, fmt.Errorf("cms: 3des contentinfo: %w", err)
 	}
 	return der, nil
+}
+
+// pkcs7Pad pads a block-aligned buffer per PKCS#7 (RFC 5652 §6.3).
+func pkcs7Pad(data []byte, blockSize int) []byte {
+	padLen := blockSize - len(data)%blockSize
+	out := make([]byte, len(data)+padLen)
+	copy(out, data)
+	for i := len(data); i < len(out); i++ {
+		out[i] = byte(padLen)
+	}
+	return out
+}
+
+// marshalEncryptedContent wraps ciphertext in the primitive context tag [0]
+// the library uses (IsCompound: false in smallstep/pkcs7 v0.2.2 — the bytes
+// go directly under the tag, not inside an OCTET STRING).
+func marshalEncryptedContent(content []byte) asn1.RawValue {
+	return asn1.RawValue{Bytes: content, Class: 2, IsCompound: false}
 }
 
 // SignOptions configures Sign.

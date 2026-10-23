@@ -549,7 +549,10 @@ func TestGetCACapsOmitsWeakAlgorithms(t *testing.T) {
 	raw, _ := io.ReadAll(resp.Body)
 	caps := string(raw)
 
-	for _, weak := range []string{"SHA-1", "DES", "GetNextCACert"} {
+	// SHA-1 and single-DES stay unadvertised: SHA-1 is collision-broken, and
+	// DES-CBC has no clients that need it. DES3 IS advertised — Apple's SCEP
+	// client requires 3DES for the reply envelope (see handler.getCACaps).
+	for _, weak := range []string{"SHA-1", "DES-CBC", "GetNextCACert"} {
 		if strings.Contains(caps, weak) {
 			t.Errorf("GetCACaps advertises %q:\n%s", weak, caps)
 		}
@@ -596,4 +599,144 @@ func parseDegenerate(der []byte) ([]*x509.Certificate, error) {
 		return nil, err
 	}
 	return p7.Certificates, nil
+}
+
+// --- reply cipher echo --------------------------------------------------------
+
+// buildPKIOperationWithAlg is buildPKIOperation with an explicit envelope
+// cipher, mirroring what heterogeneous SCEP clients actually send: Apple's
+// mdmclient encrypts with 3DES; modern clients advertise AES.
+func buildPKIOperationWithAlg(t *testing.T, csrDER []byte, ra *x509.Certificate, signer *keypair,
+	mt MessageType, txID string, nonce []byte, alg cms.EncryptionAlg) []byte {
+	t.Helper()
+	env, err := cms.EncryptWithAlg(csrDER, ra, alg)
+	if err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	der, err := cms.Sign(env, signer.cert, signer.key, cms.SignOptions{
+		Attributes: []cms.Attribute{
+			{Type: oidMessageType, Value: string(mt)},
+			{Type: oidTransactionID, Value: txID},
+			{Type: oidSenderNonce, Value: nonce},
+		},
+	})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return der
+}
+
+// replyEnvelopeAlg parses a CertRep body and reports its reply envelope cipher.
+// The response body is consumed, so each test parses status and cipher from one
+// response via certRepStatusAndEnvelopeAlg.
+func replyEnvelopeAlg(t *testing.T, resp *http.Response) cms.EncryptionAlg {
+	t.Helper()
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var v cms.Verifier
+	signed, err := v.VerifySignature(raw)
+	if err != nil {
+		t.Fatalf("response not verifiable: %v", err)
+	}
+	alg, found := cms.DetectContentAlg(signed.Content)
+	if !found {
+		t.Fatal("reply envelope cipher not recognized")
+	}
+	return alg
+}
+
+// certRepStatusAndEnvelopeAlg reads one CertRep response once, reporting both
+// the pkiStatus and the reply envelope cipher.
+func certRepStatusAndEnvelopeAlg(t *testing.T, resp *http.Response) (PKIStatus, cms.EncryptionAlg) {
+	t.Helper()
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var v cms.Verifier
+	signed, err := v.VerifySignature(raw)
+	if err != nil {
+		t.Fatalf("response not verifiable: %v", err)
+	}
+	var status string
+	if err := signed.UnmarshalAttribute(oidPKIStatus, &status); err != nil {
+		t.Fatalf("no pkiStatus: %v", err)
+	}
+	alg, found := cms.DetectContentAlg(signed.Content)
+	if !found {
+		t.Fatal("reply envelope cipher not recognized")
+	}
+	return PKIStatus(status), alg
+}
+
+// TestReplyEchoesDES3Request is the Apple-compatibility invariant: RFC 8894
+// §3.5 makes the reply cipher follow the request cipher, and Apple's SCEP
+// client only decrypts 3DES replies. An AES-only reply yields a cert the Mac
+// can never read.
+func TestReplyEchoesDES3Request(t *testing.T) {
+	h := newHarness(t)
+	client := issue(t, "device01.example.com", nil, false)
+	csr := makeCSR(t, "device01.example.com", client.key)
+	msg := buildPKIOperationWithAlg(t, csr, h.ra.cert, client, PKCSReq,
+		"tx-des3", testNonce(), cms.EncryptionAlgorithmDESEDE3CBC)
+
+	resp := h.post(t, msg)
+	status, alg := certRepStatusAndEnvelopeAlg(t, resp)
+	if status != StatusSuccess {
+		t.Fatalf("3DES request status = %v, want success", status)
+	}
+	if alg != cms.EncryptionAlgorithmDESEDE3CBC {
+		t.Fatalf("reply envelope = %d, want 3DES", alg)
+	}
+}
+
+// TestReplyEchoesAESRequest: clients that sent AES get AES replies.
+func TestReplyEchoesAESRequest(t *testing.T) {
+	h := newHarness(t)
+	client := issue(t, "device01.example.com", nil, false)
+	csr := makeCSR(t, "device01.example.com", client.key)
+	msg := buildPKIOperationWithAlg(t, csr, h.ra.cert, client, PKCSReq,
+		"tx-aes", testNonce(), pkcs7.EncryptionAlgorithmAES256CBC)
+
+	resp := h.post(t, msg)
+	status, alg := certRepStatusAndEnvelopeAlg(t, resp)
+	if status != StatusSuccess {
+		t.Fatalf("AES request status = %v, want success", status)
+	}
+	if alg != pkcs7.EncryptionAlgorithmAES256CBC {
+		t.Fatalf("reply envelope = %d, want AES256CBC", alg)
+	}
+}
+
+// TestDES3ReplyDecryptsToIssuedCert: the 3DES reply opens with the requester's
+// key and carries the issued certificate — the full Apple path.
+func TestDES3ReplyDecryptsToIssuedCert(t *testing.T) {
+	h := newHarness(t)
+	client := issue(t, "device01.example.com", nil, false)
+	csr := makeCSR(t, "device01.example.com", client.key)
+	msg := buildPKIOperationWithAlg(t, csr, h.ra.cert, client, PKCSReq,
+		"tx-des3-full", testNonce(), cms.EncryptionAlgorithmDESEDE3CBC)
+
+	resp := h.post(t, msg)
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var v cms.Verifier
+	signed, err := v.VerifySignature(raw)
+	if err != nil {
+		t.Fatalf("response not verifiable: %v", err)
+	}
+	plain, err := cms.Decrypt(signed.Content, client.cert, client.key)
+	if err != nil {
+		t.Fatalf("3DES reply did not decrypt to the requester: %v", err)
+	}
+	// The envelope carries the degenerate certs-only SignedData.
+	p7, err := pkcs7.Parse(plain)
+	if err != nil {
+		t.Fatalf("reply payload is not a certs-only CMS: %v", err)
+	}
+	certs := p7.Certificates
+	if len(certs) != 1 || certs[0].Subject.CommonName != "device01.example.com" {
+		t.Fatalf("reply carried %d certs; want the issued device cert", len(certs))
+	}
 }

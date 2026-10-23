@@ -19,6 +19,11 @@ type Request struct {
 	// SignerAuthenticated is true ONLY for a RenewalReq verified against the
 	// device anchor. A PKCSReq signer is self-signed, so it is always false.
 	SignerAuthenticated bool
+	// ReplyAlg is the content-encryption algorithm of the request envelope.
+	// RFC 8894 §3.5: the reply uses the same algorithm, so the client can
+	// decrypt it. Apple's SCEP client always sends 3DES. Zero means the
+	// algorithm was not recognized and the reply falls back to the default.
+	ReplyAlg cms.EncryptionAlg
 }
 
 // Parser turns a PKIOperation body into a Request.
@@ -79,6 +84,11 @@ func (p *Parser) Parse(der []byte) (*Request, error) {
 		return nil, err
 	}
 
+	// 4b. Record the request envelope's content-encryption algorithm so the
+	// reply can echo it (RFC 8894 §3.5). Detection failures are non-fatal:
+	// the reply then uses the configured default, exactly as before.
+	replyAlg, _ := cms.DetectContentAlg(signed.Content)
+
 	// 5. Parse the CSR, which checks proof-of-possession and key bounds.
 	csr, err := p.ParseCSR(csrDER)
 	if err != nil {
@@ -90,6 +100,7 @@ func (p *Parser) Parse(der []byte) (*Request, error) {
 		CSR:                 csr,
 		Signer:              signed.Signer,
 		SignerAuthenticated: authenticated,
+		ReplyAlg:            replyAlg,
 	}, nil
 }
 
@@ -112,9 +123,11 @@ func (r *Responder) Success(req *Request, issued *x509.Certificate) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	// Encrypted to the requester's own certificate, so only the holder of that
-	// key can open the reply — a replayer cannot read it.
-	enveloped, err := cms.Encrypt(certsOnly, req.Signer)
+	// Encrypted to the requester's own certificate with the cipher of the
+	// request envelope (RFC 8894 §3.5), so only the holder of that key can
+	// open the reply — a replayer cannot read it. Apple's client insists on
+	// 3DES; echoing the request's cipher keeps every client compatible.
+	enveloped, err := cms.EncryptWithAlg(certsOnly, req.Signer, req.ReplyAlg)
 	if err != nil {
 		return nil, err
 	}

@@ -304,3 +304,70 @@ func TestDegenerateCertsOnlyRequiresACert(t *testing.T) {
 		t.Fatal("expected an error with no certificates")
 	}
 }
+
+func TestDES3EnvelopeRoundTrip(t *testing.T) {
+	ca, _ := newCA(t, "issuing CA")
+	ra := issue(t, "RA", ca, false)
+
+	payload := []byte("issued certificate DER would go here")
+	der, err := EncryptWithAlg(payload, ra.cert, EncryptionAlgorithmDESEDE3CBC)
+	if err != nil {
+		t.Fatalf("EncryptWithAlg(DES3): %v", err)
+	}
+
+	alg, found := DetectContentAlg(der)
+	if !found {
+		t.Fatal("DetectContentAlg: 3DES envelope not recognized")
+	}
+	if alg != EncryptionAlgorithmDESEDE3CBC {
+		t.Fatalf("DetectedContentAlg = %d, want 3DES", alg)
+	}
+
+	got, err := Decrypt(der, ra.cert, ra.key)
+	if err != nil {
+		t.Fatalf("Decrypt of 3DES envelope: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("round trip mismatch: got %q", got)
+	}
+}
+
+func TestDetectContentAlgAES(t *testing.T) {
+	ca, _ := newCA(t, "issuing CA")
+	ra := issue(t, "RA", ca, false)
+
+	der, err := Encrypt([]byte("aes payload"), ra.cert)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	alg, found := DetectContentAlg(der)
+	if !found {
+		t.Fatal("DetectContentAlg: AES envelope not recognized")
+	}
+	if alg != pkcs7.EncryptionAlgorithmAES256CBC {
+		t.Fatalf("DetectContentAlg = %d, want AES256CBC", alg)
+	}
+}
+
+func TestDetectContentAlgMalformed(t *testing.T) {
+	if _, found := DetectContentAlg([]byte("not DER")); found {
+		t.Fatal("DetectContentAlg: garbage input reported found")
+	}
+	if _, found := DetectContentAlg(nil); found {
+		t.Fatal("DetectContentAlg: empty input reported found")
+	}
+}
+
+func TestEncryptWithAlgUnknownFallsBackToAES(t *testing.T) {
+	ca, _ := newCA(t, "issuing CA")
+	ra := issue(t, "RA", ca, false)
+
+	der, err := EncryptWithAlg([]byte("payload"), ra.cert, 999)
+	if err != nil {
+		t.Fatalf("EncryptWithAlg(unknown): %v", err)
+	}
+	alg, found := DetectContentAlg(der)
+	if !found || alg != pkcs7.EncryptionAlgorithmAES256CBC {
+		t.Fatalf("unknown cipher should fall back to AES256CBC, got %d/%v", alg, found)
+	}
+}

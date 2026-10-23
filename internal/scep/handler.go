@@ -160,8 +160,11 @@ func (h *handler) getCACert(w http.ResponseWriter, r *http.Request) {
 	w.Write(der)
 }
 
-// getCACaps is deliberately conservative: no SHA-1, no DES, and no
-// GetNextCACert, since there is no rollover support.
+// getCACaps is deliberately conservative: no SHA-1, no GetNextCACert. 3DES IS
+// advertised: Apple's SCEP client encrypts requests with 3DES and decrypts
+// replies with the same cipher (RFC 8894 §3.5), so 3DES support is load-bearing
+// for macOS. AES is advertised for clients that prefer it; replies echo the
+// request's cipher either way.
 func (h *handler) getCACaps(w http.ResponseWriter, _ *http.Request) {
 	caps := []string{
 		"POSTPKIOperation",
@@ -169,6 +172,7 @@ func (h *handler) getCACaps(w http.ResponseWriter, _ *http.Request) {
 		"SHA-256",
 		"SHA-512",
 		"AES",
+		"DES3",
 		"SCEPStandard",
 	}
 	w.Header().Set("Content-Type", "text/plain")
