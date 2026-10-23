@@ -113,6 +113,10 @@ type OpenBao struct {
 type AppRole struct {
 	MountPath string `yaml:"mount_path"` // auth mount, default "approle"
 	RoleID    string `yaml:"role_id"`
+	// RoleIDEnv names the env var holding the RoleID; wins over the inline
+	// value. A RoleID is an identifier, not a credential, but this keeps the
+	// static config environment-agnostic.
+	RoleIDEnv string `yaml:"role_id_env"`
 	// SecretIDFile reads the SecretID from a file, preferred over the env var
 	// (env leaks via /proc, ps, crash dumps). Wins when both are set.
 	SecretIDFile string `yaml:"secret_id_file"`
@@ -377,6 +381,25 @@ func (c *Config) ResolveSecretID() (string, error) {
 		return "", fmt.Errorf("secret id env %q is empty", c.OpenBao.AppRole.SecretIDEnv)
 	}
 	return v, nil
+}
+
+// ResolveRoleID resolves the AppRole RoleID: an env var name in RoleIDEnv wins
+// over the inline RoleID value. A RoleID is an identifier, not a credential,
+// but routing it through the same KV-published secret as the SecretID keeps
+// the broker's static config environment-agnostic (the Telnyx AppRole module
+// assigns a random RoleID, so no static value exists to bake into config).
+func (c *Config) ResolveRoleID() (string, error) {
+	if env := c.OpenBao.AppRole.RoleIDEnv; env != "" {
+		v, ok := os.LookupEnv(env)
+		if !ok || v == "" {
+			return "", fmt.Errorf("role id env %q is empty", env)
+		}
+		return v, nil
+	}
+	if c.OpenBao.AppRole.RoleID == "" {
+		return "", fmt.Errorf("approle.role_id or approle.role_id_env is required")
+	}
+	return c.OpenBao.AppRole.RoleID, nil
 }
 
 // ServerTLSCertificate loads the server's TLS certificate and key.

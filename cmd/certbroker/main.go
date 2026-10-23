@@ -48,11 +48,15 @@ func run(logger *slog.Logger, configPath string, devAllowAll bool, devRole strin
 	}
 
 	// --- OpenBao client ---
-	secretID, err := cfg.ResolveSecretID()
+	roleID, err := cfg.ResolveRoleID()
 	if err != nil {
 		return err
 	}
 	caCert, err := cfg.OpenBaoCACert()
+	if err != nil {
+		return err
+	}
+	secretID, err := cfg.ResolveSecretID()
 	if err != nil {
 		return err
 	}
@@ -61,7 +65,7 @@ func run(logger *slog.Logger, configPath string, devAllowAll bool, devRole strin
 		PKIMount:       cfg.OpenBao.Mount,
 		CACertPEM:      caCert,
 		AppRoleMount:   cfg.OpenBao.AppRole.MountPath,
-		RoleID:         cfg.OpenBao.AppRole.RoleID,
+		RoleID:         roleID,
 		SecretID:       secretID,
 		RenewThreshold: cfg.OpenBao.AppRole.RenewThreshold.Std(),
 		MaxRetries:     cfg.OpenBao.MaxRetries,
